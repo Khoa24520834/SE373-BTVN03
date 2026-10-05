@@ -123,6 +123,7 @@ class FlightFact:
     price: int
     refundable: bool
     checked_price: int | None = None  # giá thấy ở check_seat, dùng để kiểm chứng chéo
+    unavailable: bool = False         # đã biết hết ghế (check_seat/book_seat báo sold_out)
 
     @property
     def effective_price(self) -> int:
@@ -593,10 +594,11 @@ class Harness:
         return StepOutcome(observation=obs, stop=reason, detail=detail,
                            handoff=self.finish(reason, detail), executed=executed)
 
-    def finish(self, reason: StopReason, detail: str = "") -> Handoff:
-        """Ghi nhận lý do dừng và lập bản bàn giao. Dừng bất thường mà im lặng là lỗi ẩn."""
+    def finish(self, reason: StopReason, detail: str = "", question: str | None = None) -> Handoff:
+        """Ghi nhận lý do dừng và lập bản bàn giao. Dừng bất thường mà im lặng là lỗi ẩn.
+        question: câu hỏi riêng cho người nhận; mẫu thiết kế biết rõ tình huống nên hỏi sát hơn câu mặc định."""
         self.stop_reason, self.stop_detail = reason, detail
-        self.handoff = self.make_handoff(reason, detail)
+        self.handoff = self.make_handoff(reason, detail, question)
         return self.handoff
 
     # ---- học từ observation ------------------------------------------------ #
@@ -610,6 +612,10 @@ class Harness:
             fact = self.flights.get(obs["flight"])
             if fact is not None:
                 fact.checked_price, fact.refundable = obs["price"], obs["refundable"]
+        elif tool in ("check_seat", "book_seat") and obs.get("status") == "sold_out":
+            fact = self.flights.get(str(obs.get("flight", "")).upper())
+            if fact is not None:
+                fact.unavailable = True  # bản bàn giao không được gợi ý lại chuyến đã hết ghế
         if "booking" in obs:  # schema hợp lệ: parse theo model Booking
             try:
                 booking = Booking.model_validate(obs["booking"])
@@ -669,10 +675,10 @@ class Harness:
         return FinalVerdict(False, None, problems, feedback)
 
     # ---- bàn giao ---------------------------------------------------------- #
-    def make_handoff(self, reason: StopReason, detail: str = "") -> Handoff:
+    def make_handoff(self, reason: StopReason, detail: str = "", question: str | None = None) -> Handoff:
         return Handoff(reason=reason, status=self._status_line(),
                        side_effects=self._side_effect_lines(), tried=self._tried_lines(),
-                       question=self._question(reason, detail),
+                       question=question if question is not None else self._question(reason, detail),
                        pending=self._pending_line() if reason is StopReason.HUMAN else "",
                        detail=detail)
 
@@ -680,11 +686,15 @@ class Harness:
         if not self.flights:
             parts = ["chưa tìm được chuyến nào"]
         else:
-            feasible = sorted((f for f in self.flights.values() if not self.constraints.flight_violations(f)),
+            feasible = sorted((f for f in self.flights.values()
+                               if not f.unavailable and not self.constraints.flight_violations(f)),
                               key=lambda f: f.effective_price)
             s = f"đã thấy {len(self.flights)} chuyến, {len(feasible)} chuyến thoả mọi ràng buộc"
             if feasible:
                 s += f" (rẻ nhất: {feasible[0].code} {vnd(feasible[0].effective_price)})"
+            gone = [f.code for f in self.flights.values() if f.unavailable]
+            if gone:
+                s += f"; đã hết ghế: {', '.join(gone)}"
             parts = [s]
         for b in self.bookings.values():
             state = "đã thanh toán" if b.paid else "đã giữ chỗ, CHƯA thanh toán"

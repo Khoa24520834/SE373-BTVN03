@@ -34,7 +34,7 @@ from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 
-from common import HARNESS_SOURCE, STYLES, RunResult, make_model, render_trace
+from common import HARNESS_SOURCE, STYLES, RunResult, make_model, print_result, render_trace
 from harness import Budget, Constraints, Harness, StopReason
 from tools_flight import SCENARIOS, FlightWorld, make_langchain_tools
 
@@ -161,20 +161,6 @@ def run_react(scenario: str = "happy", *, model: Any = "fake", style: str = "com
     )
 
 
-def _print_result(r: RunResult) -> None:
-    rep = r.report
-    print(f"=== ReAct · kịch bản {r.scenario} ===\n")
-    print(r.trace)
-    print("\n--- Kết quả ---")
-    print(f"Kiểu dừng : {rep['stop_letter']} ({rep['stop']}) · {rep['stop_detail']}")
-    print(f"Thành công: {rep['success']} (theo is_done)")
-    print(f"Tốn       : {rep['rounds']} lần gọi model · {rep['tool_calls']} lần gọi tool · "
-          f"{rep['tokens']} token · {rep['cost_usd']} USD · {rep['seconds']}s")
-    print(f"Can thiệp : {rep['interventions'] or 'không'} · tác dụng phụ: {rep['side_effects'] or 'không'}")
-    if rep["ungrounded"]:
-        print(f"Bịa       : {rep['ungrounded']}")
-
-
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):  # in tiếng Việt đúng trên console Windows
         sys.stdout.reconfigure(encoding="utf-8")
@@ -187,4 +173,4 @@ if __name__ == "__main__":
         result = run_react(args.scenario, model=args.model, style=args.style)
     except RuntimeError as exc:  # ví dụ: --model real mà chưa đặt SE373_MODEL
         parser.error(str(exc))
-    _print_result(result)
+    print_result(result)

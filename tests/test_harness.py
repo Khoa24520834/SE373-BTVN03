@@ -361,3 +361,23 @@ def test_report_co_du_truong_cho_evaluate():
     assert set(rep) == {"stop", "stop_letter", "stop_detail", "success", "rounds", "tool_calls",
                         "tokens", "cost_usd", "seconds", "interventions", "ungrounded", "side_effects"}
     assert rep["stop"] == "loop" and rep["success"] is False and rep["tokens"] == 1100
+
+
+def test_finish_cho_phep_mau_thiet_ke_dat_cau_hoi_rieng():
+    w, h = make()
+    default = h.finish(StopReason.STALL, "x")
+    assert "nới ràng buộc" in default.question  # câu hỏi mặc định
+    custom = h.finish(StopReason.STALL, "x", question="Cho phép lập lại kế hoạch không?")
+    assert custom.question == "Cho phép lập lại kế hoạch không?"
+    assert "Câu hỏi        : Cho phép lập lại kế hoạch không?" in custom.render()
+    assert h.stop_reason is StopReason.STALL and h.handoff is custom
+
+
+def test_ban_giao_khong_goi_y_lai_chuyen_da_het_ghe():
+    w, h = make("env_change")
+    search(h, w)
+    assert "rẻ nhất: VJ604 1.290.000đ" in h._status_line()
+    call(h, w, "check_seat", flight="VJ604")  # sold_out
+    status = h._status_line()
+    assert "rẻ nhất: VJ606 1.420.000đ" in status and "đã hết ghế: VJ604" in status
+    assert h.flights["VJ604"].unavailable and not h.flights["VJ606"].unavailable

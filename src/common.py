@@ -26,7 +26,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
-from harness import Constraints, Harness, estimate_tokens, fmt_call
+from harness import Constraints, Harness, StopReason, estimate_tokens, fmt_call
 from tools_flight import FlightWorld
 
 STYLES = ("competent", "greedy", "hallucinate")
@@ -180,6 +180,33 @@ class RunResult:
     world: FlightWorld | None = field(default=None, repr=False)
 
 
+def closing_text(harness: Harness) -> str:
+    """Tin nhắn cuối do HARNESS viết: tóm tắt đã kiểm chứng (đạt mục tiêu) hoặc bản bàn giao (dừng khác)."""
+    if harness.stop_reason is StopReason.GOAL:
+        return harness.summary()  # dựng từ dữ liệu thật nên không thể bịa
+    return harness.handoff.render() if harness.handoff else ""
+
+
+_PATTERN_LABEL = {"react": "ReAct", "plan": "Plan-then-Execute", "hybrid": "Lai (Plan + replan)"}
+
+
+def print_result(r: RunResult) -> None:
+    """In trace và số liệu một lần chạy (dùng chung cho giao diện dòng lệnh của cả ba mẫu)."""
+    rep = r.report
+    print(f"=== {_PATTERN_LABEL.get(r.pattern, r.pattern)} · kịch bản {r.scenario} ===\n")
+    print(r.trace)
+    print("\n--- Kết quả ---")
+    print(f"Kiểu dừng : {rep['stop_letter']} ({rep['stop']}) · {rep['stop_detail']}")
+    print(f"Thành công: {rep['success']} (theo is_done)")
+    print(f"Tốn       : {rep['rounds']} lần gọi model · {rep['tool_calls']} lần gọi tool · "
+          f"{rep['tokens']} token · {rep['cost_usd']} USD · {rep['seconds']}s")
+    if "plan_steps" in rep:
+        print(f"Kế hoạch  : {rep['plan_steps']} bước · lập lại {rep['replans']} lần")
+    print(f"Can thiệp : {rep['interventions'] or 'không'} · tác dụng phụ: {rep['side_effects'] or 'không'}")
+    if rep["ungrounded"]:
+        print(f"Bịa       : {rep['ungrounded']}")
+
+
 def render_trace(messages: list[BaseMessage], width: int = 140) -> str:
     """Trace theo vòng, đúng khuôn ReAct: Suy luận → Hành động → Quan sát."""
 
@@ -190,9 +217,14 @@ def render_trace(messages: list[BaseMessage], width: int = 140) -> str:
     lines: list[str] = []
     rnd = 0
     for m in messages:
-        harness_made = (m.additional_kwargs or {}).get("source") == "harness"
+        source = (m.additional_kwargs or {}).get("source")
+        harness_made = source == "harness"
         if isinstance(m, HumanMessage):
-            lines.append(f"[Harness → model] {cut(m.content)}" if harness_made else f"[Yêu cầu] {cut(m.content)}")
+            label = {"harness": "[Harness → model]", "approver": "[Người duyệt]"}.get(source, "[Yêu cầu]")
+            lines.append(f"{label} {cut(m.content)}")
+        elif isinstance(m, AIMessage) and source == "planner":  # kế hoạch do model lập (không phải một vòng)
+            lines.append("[Kế hoạch mới]" if m.additional_kwargs.get("replan") else "[Kế hoạch]")
+            lines += [f"   {ln}" for ln in str(m.content).splitlines()]
         elif isinstance(m, AIMessage) and harness_made:
             lines.append("── Harness dừng vòng lặp ──")
             lines += [f"   {ln}" for ln in str(m.content).splitlines()]
