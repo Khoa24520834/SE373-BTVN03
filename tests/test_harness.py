@@ -272,6 +272,8 @@ def test_bia_dat_ve_khong_goi_tool_bi_tu_choi_va_liet_ke_cho_bia():
     assert again.stop is StopReason.STALL  # khẳng định xong hai lần mà is_done() vẫn sai
     assert "Kết D" in h.handoff.render()
     assert h.interventions["false_claim"] == 2
+    assert len(h.ungrounded) == len(set(h.ungrounded))  # gọi hai lần vẫn không lặp mục
+    assert "khẳng định đã xong" in h.handoff.question and "nới ràng buộc" not in h.handoff.question
 
 
 def test_cau_tra_loi_dung_su_that_duoc_chap_nhan_khong_loi():

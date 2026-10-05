@@ -652,7 +652,7 @@ class Harness:
         thành công' nên nguy hiểm nhất khi sai: chỉ chấp nhận khi is_done() đúng."""
         comp = self.is_done()
         problems = self.grounding_check(answer)
-        self.ungrounded += problems
+        self.ungrounded += [p for p in problems if p not in self.ungrounded]
         if comp.done:
             self.finish(StopReason.GOAL, "model dừng và tiêu chí hoàn thành đạt")
             return FinalVerdict(True, StopReason.GOAL, problems)
@@ -729,6 +729,9 @@ class Harness:
             return f"Duyệt {what} ({vnd(p['price'])}, {'vé hoàn được' if p['refundable'] else 'vé không hoàn'}) không?"
         if reason is StopReason.LOOP:
             return f"Agent bị kẹt: {detail}. Nên thử lại sau hay đổi cách làm (ví dụ bỏ qua bước lỗi)?"
+        if reason is StopReason.STALL and self.false_claims >= self.max_false_claims:
+            return ("Model hai lần khẳng định đã xong nhưng chưa có vé nào được đặt và thanh toán. "
+                    "Nên chạy lại với prompt hoặc model khác, hay người đặt thủ công?")
         if reason is StopReason.STALL:
             return f"Agent không tiến triển: {detail}. Nên nới ràng buộc (giờ bay, giá) hay đổi ngày/tuyến?"
         if reason is StopReason.BUDGET:
