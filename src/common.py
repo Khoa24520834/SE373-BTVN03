@@ -5,7 +5,9 @@ GỒM
     ScriptedModel   Model GIẢ, tất định, ra quyết định theo observation đã thấy.
                     Chạy lại được và không tốn tiền, nên so sánh 3 mẫu công bằng.
                     Dùng khi cần lặp lại lỗi (S2 lặp, S5 bịa) mà model thật khó tái hiện.
-    make_model      "fake" → ScriptedModel; "real" → model thật đọc từ biến môi trường SE373_MODEL.
+    make_model      "fake" → ScriptedModel; "real" → Claude (ChatAnthropic) hoặc OpenAI (ChatOpenAI) dựng từ file .env.
+    load_env        Nạp file .env (không cần thư viện ngoài). CHỈ các lệnh chạy từ dòng lệnh mới gọi;
+                    pytest và các hàm thư viện không bao giờ tự đọc .env.
     RunResult       Kết quả MỘT lần chạy của MỘT mẫu (cùng khuôn cho ReAct, Plan, Lai).
     render_trace    In trace theo vòng: Suy luận → Hành động → Quan sát (đọc để tìm vòng sai đầu tiên).
 
@@ -17,9 +19,12 @@ KIỂU ỨNG XỬ CỦA MODEL GIẢ (tham số style)
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -33,9 +38,20 @@ STYLES = ("competent", "greedy", "hallucinate")
 HARNESS_SOURCE = {"source": "harness"}  # đánh dấu tin nhắn do harness chèn vào, không phải của model
 
 
+def content_text(content: Any) -> str:
+    """Chữ trong content của một tin nhắn. Claude (và vài model khác) trả content là DANH SÁCH các khối,
+    ví dụ [{"type": "text", "text": "..."}, {"type": "tool_use", ...}], khi tin nhắn có tool call."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(b if isinstance(b, str) else str(b.get("text", ""))
+                       for b in content if isinstance(b, str) or (isinstance(b, dict) and b.get("type") == "text"))
+    return "" if content is None else str(content)
+
+
 def message_text(m: BaseMessage) -> str:
     """Chữ của một tin nhắn, gồm cả tham số tool call (để ước lượng token)."""
-    text = m.content if isinstance(m.content, str) else json.dumps(m.content, ensure_ascii=False)
+    text = content_text(m.content)
     if isinstance(m, AIMessage) and m.tool_calls:
         text += json.dumps(m.tool_calls, ensure_ascii=False)
     return text
@@ -146,9 +162,197 @@ class ScriptedModel(BaseChatModel):
         return act(f"{pick} còn ghế, giữ chỗ ghế {self.seat}.", "book_seat", flight=pick, seat=self.seat)
 
 
+# --------------------------------------------------------------------------- #
+# Model thật (Claude của Anthropic hoặc OpenAI) và file .env
+# --------------------------------------------------------------------------- #
+ENV_PROVIDER, ENV_EFFORT, ENV_TEMPERATURE = "LLM_PROVIDER", "OPENAI_REASONING_EFFORT", "ANTHROPIC_TEMPERATURE"
+PLACEHOLDER_KEYS = ("your_api_key_here", "sk-...", "sk-ant-...", "changeme")
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    """Mọi thứ khác nhau giữa các nhà cung cấp: tên biến .env, địa chỉ mặc định, thư viện LangChain, nơi tạo key."""
+
+    name: str
+    label: str
+    key_env: str
+    model_env: str
+    base_env: str
+    default_base: str
+    default_model: str  # rỗng: bắt buộc phải đặt model trong .env
+    package: str        # tên gói pip
+    module: str         # tên module để import
+    console: str        # nơi tạo key và xem số dư
+
+
+PROVIDERS: dict[str, ProviderSpec] = {
+    "google": ProviderSpec("google", "Google (Gemini)", "GOOGLE_API_KEY", "GOOGLE_MODEL", "GOOGLE_BASE_URL",
+                           "", "gemini-3.8-flash", "langchain-google-genai", "langchain_google_genai",
+                           "aistudio.google.com"),
+    "anthropic": ProviderSpec("anthropic", "Anthropic (Claude)", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
+                              "ANTHROPIC_BASE_URL", "https://api.anthropic.com", "claude-haiku-4-5-20251001",
+                              "langchain-anthropic", "langchain_anthropic", "console.anthropic.com"),
+    "openai": ProviderSpec("openai", "OpenAI", "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_BASE_URL",
+                           "https://api.openai.com/v1", "", "langchain-openai", "langchain_openai",
+                           "platform.openai.com"),
+}
+ALL_KEY_ENVS = tuple(p.key_env for p in PROVIDERS.values())
+
+# Giá USD / 1 triệu token (vào, ra, hãng), theo trang model chính thức khi viết (10/2026). Nhà cung cấp khác
+# hoặc model khác có thể tính khác: dùng --price-in / --price-out để ghi đè. Model không có trong bảng thì phải tự truyền giá.
+KNOWN_PRICES_PER_1M: dict[str, tuple[float, float, str]] = {
+    "gemini-3.8-flash": (0.75, 3.75, "Google"),  # giá giới thiệu đến 31/12/2026
+    "claude-haiku-4-5-20251001": (1.00, 5.00, "Anthropic"),
+    "claude-haiku-4-5": (1.00, 5.00, "Anthropic"),
+    "gpt-5.6-luna": (0.20, 1.20, "OpenAI"),
+    "gpt-5.4-nano": (0.20, 1.25, "OpenAI"),
+    "gpt-5.4-mini": (0.75, 4.50, "OpenAI"),
+}
+
+
+def find_env_files() -> list[Path]:
+    """Các file .env sẽ được đọc, theo thứ tự ưu tiên: thư mục hiện tại, thư mục src/, thư mục gốc repo."""
+    here = Path(__file__).resolve().parent
+    seen: list[Path] = []
+    for path in (Path.cwd() / ".env", here / ".env", here.parent / ".env"):
+        path = path.resolve()
+        if path.is_file() and path not in seen:
+            seen.append(path)
+    return seen
+
+
+def _read_env_text(path: Path) -> str:
+    raw = path.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8")
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):  # PowerShell 5 ghi file bằng UTF-16 theo mặc định
+        return raw.decode("utf-16")
+    return raw.decode("utf-8")
+
+
+def load_env(paths: list[Path] | None = None) -> list[str]:
+    """Nạp các file .env vào os.environ (không cần thư viện ngoài). Biến ĐÃ có trong môi trường được giữ
+    nguyên, file ưu tiên cao hơn thắng file ưu tiên thấp hơn. Chỉ trả về TÊN biến đã nạp, không bao giờ trả về giá trị.
+    paths: danh sách file tường minh (dùng khi kiểm thử); bỏ trống thì tìm bằng find_env_files()."""
+    loaded: list[str] = []
+    for path in (find_env_files() if paths is None else paths):
+        for line in _read_env_text(path).splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.removeprefix("export ").strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = value
+                loaded.append(key)
+    return loaded
+
+
+def mask_secret(value: str | None) -> str:
+    """Hiển thị khoá bí mật an toàn: vài ký tự đầu/cuối và độ dài, KHÔNG bao giờ in nguyên khoá."""
+    if not value:
+        return "(chưa đặt)"
+    if len(value) <= 8:
+        return f"*** (dài {len(value)} ký tự)"
+    return f"{value[:3]}…{value[-4:]} (dài {len(value)} ký tự)"
+
+
+def redact_secrets(text: str) -> str:
+    """Che mọi API key nếu nó lỡ xuất hiện trong một chuỗi sắp được in hoặc ghi ra file (thông báo lỗi, CSV)."""
+    for name in ALL_KEY_ENVS:
+        key = os.environ.get(name, "").strip()
+        if len(key) > 8:
+            text = text.replace(key, mask_secret(key))
+    return text
+
+
+def detect_provider() -> ProviderSpec:
+    """LLM_PROVIDER nếu có; không thì theo key nào đang được đặt, ưu tiên Google > Claude > OpenAI."""
+    explicit = os.environ.get(ENV_PROVIDER, "").strip().lower()
+    if explicit:
+        if explicit not in PROVIDERS:
+            raise RuntimeError(f"{ENV_PROVIDER} phải là {', '.join(PROVIDERS)}, nhận được {explicit!r}.")
+        return PROVIDERS[explicit]
+    for name in ("google", "anthropic", "openai"):
+        if os.environ.get(PROVIDERS[name].key_env, "").strip():
+            return PROVIDERS[name]
+    raise RuntimeError(
+        f"Chưa có API key nào. Đặt {PROVIDERS['google'].key_env} (Gemini), {PROVIDERS['anthropic'].key_env} (Claude) "
+        f"hoặc {PROVIDERS['openai'].key_env} (OpenAI) trong file .env ở thư mục gốc repo (sao chép từ .env.example), hoặc đặt biến trong PowerShell.")
+
+
+def real_model_settings() -> dict[str, str]:
+    """Cấu hình model thật từ biến môi trường. Thiếu hoặc còn là giá trị mẫu thì báo rõ phải làm gì."""
+    spec, env = detect_provider(), os.environ
+    key = env.get(spec.key_env, "").strip()
+    model = (env.get(spec.model_env) or spec.default_model).strip()
+    missing = [name for name, value in ((spec.key_env, key), (spec.model_env, model)) if not value]
+    if missing:
+        raise RuntimeError(f"Thiếu biến môi trường: {', '.join(missing)}. Tạo file .env ở thư mục gốc repo "
+                           "(sao chép từ .env.example) hoặc đặt biến trong PowerShell.")
+    if key.lower() in PLACEHOLDER_KEYS:
+        raise RuntimeError(f"{spec.key_env} vẫn là giá trị mẫu. Mở file .env và dán API key thật.")
+    base = (env.get(spec.base_env) or spec.default_base).strip()
+    if spec.name == "anthropic":  # thư viện Anthropic tự thêm /v1/messages; dư /v1 sẽ thành /v1/v1/messages và báo 404
+        base = re.sub(r"/v1$", "", base.rstrip("/"))
+    return {"provider": spec.name, "label": spec.label, "api_key": key, "model": model, "base_url": base,
+            "key_env": spec.key_env, "model_env": spec.model_env, "base_env": spec.base_env,
+            "reasoning_effort": (env.get(ENV_EFFORT) or "").strip() if spec.name == "openai" else ""}
+
+
+def build_real_model() -> Any:
+    """Dựng model thật từ file .env: ChatAnthropic (Claude) hoặc ChatOpenAI (ép dùng Chat Completions)."""
+    settings = real_model_settings()
+    spec = PROVIDERS[settings["provider"]]
+    try:
+        module = importlib.import_module(spec.module)
+    except ImportError as exc:
+        raise RuntimeError(f"Chưa cài {spec.package}. Chạy: pip install {spec.package}") from exc
+    if spec.name == "google":
+        kwargs = {"model": settings["model"], "api_key": settings["api_key"], "max_retries": 2, "timeout": 90}
+        if settings["base_url"]:
+            kwargs["base_url"] = settings["base_url"]
+        return module.ChatGoogleGenerativeAI(**kwargs)
+    common: dict[str, Any] = {"model": settings["model"], "api_key": settings["api_key"],
+                              "base_url": settings["base_url"], "max_retries": 2}
+    if spec.name == "anthropic":
+        kwargs = {**common, "max_tokens": 4096, "timeout": 90}  # Claude bắt buộc có max_tokens
+        temperature = os.environ.get(ENV_TEMPERATURE, "").strip()
+        if temperature:
+            try:
+                kwargs["temperature"] = float(temperature)
+            except ValueError:
+                raise RuntimeError(f"{ENV_TEMPERATURE} phải là một số, nhận được {temperature!r}.") from None
+        return module.ChatAnthropic(**kwargs)
+    kwargs = {**common, "use_responses_api": False, "timeout": 90}
+    if settings["reasoning_effort"]:
+        kwargs["reasoning_effort"] = settings["reasoning_effort"]
+    return module.ChatOpenAI(**kwargs)
+
+
+def resolve_prices(model: str, price_in: float | None, price_out: float | None) -> tuple[float, float, str]:
+    """(giá vào, giá ra, nguồn) tính theo USD / 1 triệu token. Ưu tiên: tham số truyền vào > bảng đã biết > giả định."""
+    if price_in is not None and price_out is not None:
+        return price_in, price_out, "do bạn truyền vào"
+    if model in KNOWN_PRICES_PER_1M:
+        known_in, known_out, vendor = KNOWN_PRICES_PER_1M[model]
+        return (known_in if price_in is None else price_in), (known_out if price_out is None else price_out), \
+            f"bảng giá {vendor} đã kiểm tra (10/2026)"
+    return (3.0 if price_in is None else price_in), (15.0 if price_out is None else price_out), \
+        "GIẢ ĐỊNH (không biết giá của model này, hãy truyền --price-in/--price-out)"
+
+
+def apply_prices(price_in_per_1m: float, price_out_per_1m: float) -> None:
+    """Đặt giá quy đổi chi phí cho harness (Usage.cost_usd đọc hai hằng số này lúc tính)."""
+    import harness
+    harness.PRICE_IN_PER_1K, harness.PRICE_OUT_PER_1K = price_in_per_1m / 1000, price_out_per_1m / 1000
+
+
 def make_model(kind: Any = "fake", style: str = "competent", constraints: Constraints | None = None) -> Any:
-    """'fake' → ScriptedModel. 'real' → tên model trong biến môi trường SE373_MODEL
-    (ví dụ 'anthropic:claude-sonnet-4-5'); create_agent tự khởi tạo từ chuỗi này.
+    """'fake' → ScriptedModel. 'real' → ChatOpenAI dựng từ file .env (xem build_real_model).
     Truyền thẳng một đối tượng model thì trả lại nguyên (dùng khi kiểm thử)."""
     if not isinstance(kind, str):
         return kind
@@ -157,10 +361,7 @@ def make_model(kind: Any = "fake", style: str = "competent", constraints: Constr
             raise ValueError(f"style phải thuộc {STYLES}, nhận được {style!r}")
         return ScriptedModel(style=style, constraints=constraints or Constraints())
     if kind == "real":
-        name = os.environ.get("SE373_MODEL")
-        if not name:
-            raise RuntimeError("Chưa đặt biến môi trường SE373_MODEL (ví dụ 'anthropic:claude-sonnet-4-5').")
-        return name
+        return build_real_model()
     raise ValueError(f"model phải là 'fake' hoặc 'real', nhận được {kind!r}")
 
 
@@ -221,22 +422,24 @@ def render_trace(messages: list[BaseMessage], width: int = 140) -> str:
         harness_made = source == "harness"
         if isinstance(m, HumanMessage):
             label = {"harness": "[Harness → model]", "approver": "[Người duyệt]"}.get(source, "[Yêu cầu]")
-            lines.append(f"{label} {cut(m.content)}")
+            lines.append(f"{label} {cut(content_text(m.content))}")
         elif isinstance(m, AIMessage) and source == "planner":  # kế hoạch do model lập (không phải một vòng)
-            lines.append("[Kế hoạch mới]" if m.additional_kwargs.get("replan") else "[Kế hoạch]")
-            lines += [f"   {ln}" for ln in str(m.content).splitlines()]
+            label = "[Kế hoạch mới]" if m.additional_kwargs.get("replan") else "[Kế hoạch]"
+            attempt = m.additional_kwargs.get("attempt", 1)
+            lines.append(label + (f" (lần {attempt}, sau khi sửa)" if attempt > 1 else ""))
+            lines += [f"   {ln}" for ln in content_text(m.content).splitlines()]
         elif isinstance(m, AIMessage) and harness_made:
             lines.append("── Harness dừng vòng lặp ──")
-            lines += [f"   {ln}" for ln in str(m.content).splitlines()]
+            lines += [f"   {ln}" for ln in content_text(m.content).splitlines()]
         elif isinstance(m, AIMessage):
             rnd += 1
             if m.tool_calls:
-                if m.content:
-                    lines.append(f"[V{rnd}] Suy luận : {cut(m.content)}")
+                if content_text(m.content):
+                    lines.append(f"[V{rnd}] Suy luận : {cut(content_text(m.content))}")
                 for c in m.tool_calls:
                     lines.append(f"[V{rnd}] Hành động: {fmt_call(c['name'], c['args'])}")
             else:
-                lines.append(f"[V{rnd}] Trả lời   : {cut(m.content)}")
+                lines.append(f"[V{rnd}] Trả lời   : {cut(content_text(m.content))}")
         elif isinstance(m, ToolMessage):
-            lines.append(f"[V{rnd}] Quan sát : {cut(m.content)}")
+            lines.append(f"[V{rnd}] Quan sát : {cut(content_text(m.content))}")
     return "\n".join(lines)

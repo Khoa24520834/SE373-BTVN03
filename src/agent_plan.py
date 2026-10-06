@@ -36,12 +36,12 @@ CHẠY
     python src/agent_plan.py --scenario env_change --replans 1   # có replan: thích nghi (mẫu Lai)
     python src/agent_plan.py --scenario happy --reject "quá đắt" # người từ chối kế hoạch
     python src/agent_plan.py --scenario happy --planner-style wrong_date   # kế hoạch sai bị chặn
+    python src/agent_plan.py --scenario happy --model real       # planner là model thật (cần file .env)
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 import uuid
@@ -55,9 +55,10 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import Command, interrupt
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-from common import HARNESS_SOURCE, RunResult, closing_text, message_text, print_result, render_trace
+from common import (HARNESS_SOURCE, RunResult, build_real_model, closing_text, load_env, message_text,
+                    print_result, render_trace)
 from harness import Budget, Constraints, Harness, StopReason, estimate_tokens, fmt_call
 from tools_flight import SCENARIOS, SIDE_EFFECT_TOOLS, FlightWorld, make_langchain_tools
 
@@ -79,16 +80,42 @@ PLANNER_PROMPT = (
 # --------------------------------------------------------------------------- #
 # Kế hoạch là DỮ LIỆU
 # --------------------------------------------------------------------------- #
+KNOWN_STATUSES = ("ok", "invalid_param", "not_found", "sold_out", "seat_taken", "already_paid", "error")
+
+
 class PlanStep(BaseModel):
-    id: int
+    """Một bước của kế hoạch. Model thật hay viết lệch (thiếu id, kỳ vọng là câu mô tả...),
+    nên các trường được chuẩn hoá thay vì làm hỏng cả kế hoạch."""
+
+    id: int = 0  # Plan tự đánh số lại 1..n
     tool: str
     args: dict[str, Any] = Field(default_factory=dict)
     why: str = ""
     expect: str = "ok"  # trạng thái observation kỳ vọng; khác thì là LỆCH KỲ VỌNG
 
+    @field_validator("args", "why", mode="before")
+    @classmethod
+    def _none_to_default(cls, value: Any, info: Any) -> Any:
+        if value is None:
+            return {} if info.field_name == "args" else ""
+        return value
+
+    @field_validator("expect", mode="before")
+    @classmethod
+    def _expect_must_be_a_status(cls, value: Any) -> str:
+        # Chỉ trạng thái của tool mới so sánh được. Câu mô tả ("còn ghế") được hiểu là "ok",
+        # nếu không thì mọi bước đều bị coi là lệch kỳ vọng.
+        return value if value in KNOWN_STATUSES else "ok"
+
 
 class Plan(BaseModel):
     steps: list[PlanStep]
+
+    @model_validator(mode="after")
+    def _number_steps(self) -> "Plan":
+        for i, step in enumerate(self.steps, 1):
+            step.id = i
+        return self
 
     def render(self) -> str:
         return "\n".join(f"{s.id}. {fmt_call(s.tool, s.args)} · kỳ vọng {s.expect} · {s.why}" for s in self.steps)
@@ -183,7 +210,7 @@ class ScriptedPlanner(BaseChatModel):
     def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None,
                   run_manager: Any = None, **kwargs: Any) -> ChatResult:
         c: Constraints = self.constraints or Constraints()
-        text = message_text(messages[-1])
+        text = next((message_text(m) for m in messages if isinstance(m, HumanMessage)), "")
         date = "2026-10-08" if self.style == "wrong_date" else c.date
         search = ("search_flights", {"origin": c.origin, "dest": c.dest, "date": date},
                   f"Tìm các chuyến {c.origin}→{c.dest} ngày {date}")
@@ -210,7 +237,7 @@ class ScriptedPlanner(BaseChatModel):
 
 
 def make_planner_model(kind: Any = "fake", style: str = "canonical", constraints: Constraints | None = None) -> Any:
-    """'fake' → ScriptedPlanner. 'real' → model thật từ biến môi trường SE373_MODEL.
+    """'fake' → ScriptedPlanner. 'real' → ChatOpenAI dựng từ file .env (cùng cách với ReAct).
     Truyền thẳng một đối tượng model thì trả lại nguyên (dùng khi kiểm thử)."""
     if not isinstance(kind, str):
         return kind
@@ -219,11 +246,7 @@ def make_planner_model(kind: Any = "fake", style: str = "canonical", constraints
             raise ValueError(f"planner_style phải thuộc {PLANNER_STYLES}, nhận được {style!r}")
         return ScriptedPlanner(style=style, constraints=constraints or Constraints())
     if kind == "real":
-        name = os.environ.get("SE373_MODEL")
-        if not name:
-            raise RuntimeError("Chưa đặt biến môi trường SE373_MODEL (ví dụ 'anthropic:claude-sonnet-4-5').")
-        from langchain.chat_models import init_chat_model
-        return init_chat_model(name)
+        return build_real_model()
     raise ValueError(f"model phải là 'fake' hoặc 'real', nhận được {kind!r}")
 
 
@@ -257,12 +280,14 @@ class Unresolvable(Exception):
 
 class PlanExecuteAgent:
     def __init__(self, harness: Harness, tools: list[Any], planner: Any, *, request: str,
-                 max_replans: int = 0, max_retries: int = 2, approver: Approver = approve_all) -> None:
+                 max_replans: int = 0, max_retries: int = 2, max_plan_retries: int = 1,
+                 approver: Approver = approve_all) -> None:
         self.h = harness
         self.tools = {t.name: t for t in tools}
         self.planner = planner
         self.request = request
         self.max_replans, self.max_retries, self.approver = max_replans, max_retries, approver
+        self.max_plan_retries = max_plan_retries  # số lần planner được sửa kế hoạch sau phản hồi lỗi
         self.prompt = f"{PLANNER_PROMPT} {harness.constraints.to_prompt()}"
 
     def build(self) -> Any:
@@ -302,30 +327,41 @@ class PlanExecuteAgent:
     def planner_node(self, state: PlanState) -> dict[str, Any]:
         replanning = bool(state.get("deviation"))
         # Ngân sách đã được run_tool_call kiểm sau mỗi tool call; tới được đây nghĩa là còn ngân sách để gọi model.
-        messages = [SystemMessage(content=self.prompt),
-                    HumanMessage(content=self._planner_request(state, replanning))]
-        ai = self.planner.invoke(messages)
-        usage = getattr(ai, "usage_metadata", None) or {}
-        self.h.charge_model_call(
-            usage.get("input_tokens") or estimate_tokens("\n".join(message_text(m) for m in messages)),
-            usage.get("output_tokens") or estimate_tokens(message_text(ai)))
+        messages: list[BaseMessage] = [SystemMessage(content=self.prompt),
+                                       HumanMessage(content=self._planner_request(state, replanning))]
+        shown: list[BaseMessage] = []  # các tin nhắn đưa vào trace
+        plan: Plan | None = None
+        problems: list[str] = []
+        for attempt in range(1, self.max_plan_retries + 2):
+            ai = self.planner.invoke(messages)
+            usage = getattr(ai, "usage_metadata", None) or {}
+            self.h.charge_model_call(
+                usage.get("input_tokens") or estimate_tokens("\n".join(message_text(m) for m in messages)),
+                usage.get("output_tokens") or estimate_tokens(message_text(ai)))
+            text = message_text(ai)
+            try:
+                plan = parse_plan(text)
+                problems = lint_plan(plan, self.h)
+            except PlanError as exc:
+                plan, problems = None, [str(exc)]
+            shown.append(AIMessage(content=plan.render() if plan else text[:400],
+                                   additional_kwargs={"source": "planner", "replan": replanning, "attempt": attempt}))
+            if not problems:
+                break
+            if attempt <= self.max_plan_retries:
+                # Còn lượt sửa: phản hồi lỗi cho planner (model thật hay sai vặt), chưa làm phiền người duyệt.
+                feedback = "Kế hoạch bị từ chối: " + "; ".join(problems) + ". Hãy sửa và trả về lại MỘT JSON hợp lệ."
+                messages = messages + [AIMessage(content=text), HumanMessage(content=feedback)]
+                shown.append(HumanMessage(content=feedback, additional_kwargs=HARNESS_SOURCE))
 
-        source = {"source": "planner", "replan": replanning}
-        try:
-            plan = parse_plan(message_text(ai))
-        except PlanError as exc:
-            self.h.finish(StopReason.STALL, f"planner không sinh được kế hoạch hợp lệ: {exc}",
-                          question="Planner trả về kế hoạch không đọc được. Nên chạy lại hay chỉnh prompt/model?")
-            return {"messages": [AIMessage(content=message_text(ai)[:400], additional_kwargs=source)]}
-
-        update: dict[str, Any] = {
-            "messages": [AIMessage(content=plan.render(), additional_kwargs=source)],
-            "plan": plan.model_dump(), "cursor": 0, "retries": 0, "deviation": "", "bindings": {},
-            "replans": state.get("replans", 0) + (1 if replanning else 0),
-        }
-        problems = lint_plan(plan, self.h)
+        update: dict[str, Any] = {"messages": shown}
+        if plan is not None:
+            update.update(plan=plan.model_dump(), cursor=0, retries=0, deviation="", bindings={},
+                          replans=state.get("replans", 0) + (1 if replanning else 0))
         if problems:
-            self.h.finish(StopReason.STALL, "kế hoạch không qua kiểm tra: " + "; ".join(problems),
+            detail = (f"kế hoạch không qua kiểm tra: {'; '.join(problems)}" if plan is not None
+                      else f"planner không sinh được kế hoạch hợp lệ: {problems[0]}")
+            self.h.finish(StopReason.STALL, detail,
                           question="Planner sinh kế hoạch sai. Nên chạy lại hay chỉnh prompt/model?")
         return update
 
@@ -459,18 +495,21 @@ class PlanExecuteAgent:
 # --------------------------------------------------------------------------- #
 def run_plan(scenario: str = "happy", *, model: Any = "fake", planner_style: str = "canonical",
              budget: Budget | None = None, constraints: Constraints | None = None,
-             max_replans: int = 0, max_retries: int = 2, approver: Approver | None = None,
-             recursion_limit: int = 100, pattern: str | None = None) -> RunResult:
+             max_replans: int = 0, max_retries: int = 2, max_plan_retries: int = 1,
+             approver: Approver | None = None, recursion_limit: int = 100,
+             pattern: str | None = None) -> RunResult:
     """Chạy MỘT lần Plan-then-Execute (max_replans=0) hoặc mẫu Lai (max_replans>0) trong MỘT kịch bản.
 
-    model: "fake" (planner giả), "real" (đọc SE373_MODEL), hoặc một đối tượng chat model.
+    model: "fake" (planner giả), "real" (model thật từ file .env), hoặc một đối tượng chat model.
+    max_plan_retries: số lần planner được sửa kế hoạch sau khi harness báo lỗi (mỗi lần tính một lần gọi model).
     approver: hàm nhận {"plan", "estimate"}, trả True để đồng ý, False hoặc chuỗi lý do để từ chối."""
     constraints = constraints or Constraints()
     world = FlightWorld(scenario)
     harness = Harness(world, constraints, budget=budget)
     agent = PlanExecuteAgent(harness, make_langchain_tools(world), make_planner_model(model, planner_style, constraints),
                              request=constraints.request_text(), max_replans=max_replans,
-                             max_retries=max_retries, approver=approver or approve_all)
+                             max_retries=max_retries, max_plan_retries=max_plan_retries,
+                             approver=approver or approve_all)
     graph = agent.build()
     config = {"configurable": {"thread_id": uuid.uuid4().hex}, "recursion_limit": recursion_limit}
 
@@ -499,18 +538,20 @@ def run_plan(scenario: str = "happy", *, model: Any = "fake", planner_style: str
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):  # in tiếng Việt đúng trên console Windows
         sys.stdout.reconfigure(encoding="utf-8")
+    load_env()  # nạp .env cho --model real (pytest và hàm thư viện không bao giờ tự đọc .env)
     parser = argparse.ArgumentParser(description="Chạy agent Plan-then-Execute (hoặc Lai nếu --replans > 0)")
     parser.add_argument("--scenario", choices=SCENARIOS, default="happy")
     parser.add_argument("--model", choices=("fake", "real"), default="fake")
     parser.add_argument("--planner-style", choices=PLANNER_STYLES, default="canonical")
     parser.add_argument("--replans", type=int, default=0, help="số lần được lập lại kế hoạch (0 = Plan thuần)")
     parser.add_argument("--retries", type=int, default=2, help="số lần thử lại một bước khi tool báo lỗi")
+    parser.add_argument("--plan-retries", type=int, default=1, help="số lần planner được sửa kế hoạch sai")
     parser.add_argument("--reject", metavar="LÝ DO", help="mô phỏng người duyệt TỪ CHỐI kế hoạch")
     args = parser.parse_args()
     try:
         outcome = run_plan(args.scenario, model=args.model, planner_style=args.planner_style,
-                           max_replans=args.replans, max_retries=args.retries,
+                           max_replans=args.replans, max_retries=args.retries, max_plan_retries=args.plan_retries,
                            approver=(lambda payload: args.reject) if args.reject else None)
-    except RuntimeError as exc:  # ví dụ: --model real mà chưa đặt SE373_MODEL
+    except RuntimeError as exc:  # ví dụ: --model real mà chưa có file .env
         parser.error(str(exc))
     print_result(outcome)

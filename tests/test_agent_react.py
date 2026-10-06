@@ -195,8 +195,8 @@ def test_make_model(monkeypatch):
         make_model("fake", "khong-co")
     with pytest.raises(ValueError):
         make_model("abc")
-    monkeypatch.delenv("SE373_MODEL", raising=False)
-    with pytest.raises(RuntimeError, match="SE373_MODEL"):
+    with pytest.raises(RuntimeError, match="Chưa có API key nào"):
         make_model("real")
-    monkeypatch.setenv("SE373_MODEL", "provider:model-x")
-    assert make_model("real") == "provider:model-x"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "your_api_key_here")  # còn là giá trị mẫu trong .env.example
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY vẫn là giá trị mẫu"):
+        make_model("real")

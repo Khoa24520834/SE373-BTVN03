@@ -19,7 +19,7 @@ CHẠY
     python src/agent_react.py --scenario approval
     python src/agent_react.py --scenario env_change
     python src/agent_react.py --scenario happy --style hallucinate     # S5: bịa
-    python src/agent_react.py --scenario happy --model real            # cần SE373_MODEL + API key
+    python src/agent_react.py --scenario happy --model real            # model thật, cần file .env (xem .env.example)
 """
 from __future__ import annotations
 
@@ -34,7 +34,8 @@ from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 
-from common import HARNESS_SOURCE, STYLES, RunResult, make_model, print_result, render_trace
+from common import (HARNESS_SOURCE, STYLES, RunResult, content_text, load_env, make_model, print_result,
+                    render_trace)
 from harness import Budget, Constraints, Harness, StopReason
 from tools_flight import SCENARIOS, FlightWorld, make_langchain_tools
 
@@ -46,8 +47,7 @@ SYSTEM_PROMPT = (
 
 
 def _text(message: Any) -> str:
-    content = message.content
-    return content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+    return content_text(message.content)  # Claude trả content là danh sách khối khi có tool call
 
 
 def _parse_observation(message: Any) -> dict[str, Any]:
@@ -129,7 +129,7 @@ def run_react(scenario: str = "happy", *, model: Any = "fake", style: str = "com
               recursion_limit: int = 100) -> RunResult:
     """Chạy MỘT lần agent ReAct trong MỘT kịch bản và trả về RunResult.
 
-    model: "fake" (model giả), "real" (đọc SE373_MODEL), hoặc một đối tượng model.
+    model: "fake" (model giả), "real" (model thật từ file .env), hoặc một đối tượng model.
     recursion_limit: lưới an toàn cứng của LangGraph, đặt cao hơn ngân sách của harness để
     harness luôn dừng trước và còn chẩn đoán được."""
     constraints = constraints or Constraints()
@@ -164,6 +164,7 @@ def run_react(scenario: str = "happy", *, model: Any = "fake", style: str = "com
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):  # in tiếng Việt đúng trên console Windows
         sys.stdout.reconfigure(encoding="utf-8")
+    load_env()  # nạp .env cho --model real (pytest và hàm thư viện không bao giờ tự đọc .env)
     parser = argparse.ArgumentParser(description="Chạy agent ReAct đặt vé")
     parser.add_argument("--scenario", choices=SCENARIOS, default="happy")
     parser.add_argument("--style", choices=STYLES, default="competent", help="kiểu ứng xử của model giả")
@@ -171,6 +172,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         result = run_react(args.scenario, model=args.model, style=args.style)
-    except RuntimeError as exc:  # ví dụ: --model real mà chưa đặt SE373_MODEL
+    except RuntimeError as exc:  # ví dụ: --model real mà chưa có file .env
         parser.error(str(exc))
     print_result(result)

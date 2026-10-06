@@ -295,6 +295,54 @@ def test_make_planner_model(monkeypatch):
         make_planner_model("fake", "khong-co")
     with pytest.raises(ValueError):
         make_planner_model("abc")
-    monkeypatch.delenv("SE373_MODEL", raising=False)
-    with pytest.raises(RuntimeError, match="SE373_MODEL"):
+    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
         make_planner_model("real")
+
+
+# -------------------------------------- chịu được đầu ra của model thật, tự sửa kế hoạch
+class SequencePlanner(ScriptedPlanner):
+    """Planner giả trả về lần lượt các đoạn chữ cho trước: lần gọi thứ n lấy phần tử n (n = số tin nhắn AI đã có)."""
+
+    texts: list = []
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        n = sum(isinstance(m, AIMessage) for m in messages)
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=self.texts[min(n, len(self.texts) - 1)]))])
+
+
+GOOD_PLAN = json.dumps({"steps": [
+    {"id": 1, "tool": "search_flights", "args": {"origin": "SGN", "dest": "DAD", "date": DATE}},
+    {"id": 2, "tool": "check_seat", "args": {"flight": "$best"}},
+    {"id": 3, "tool": "book_seat", "args": {"flight": "$best", "seat": "12A"}},
+    {"id": 4, "tool": "pay", "args": {"code": "$booking_code", "method": "corp_card"}}]})
+
+
+def test_plan_chuan_hoa_dau_ra_long_xon_cua_model_that():
+    plan = parse_plan(json.dumps({"steps": [
+        {"tool": "search_flights", "args": {"origin": "SGN", "dest": "DAD", "date": DATE}, "why": None,
+         "expect": "tìm thấy chuyến bay"},          # thiếu id, why null, kỳ vọng là câu mô tả
+        {"id": 7, "tool": "check_seat", "args": None, "expect": "sold_out"},  # id lạ, args null, kỳ vọng hợp lệ
+    ]}))
+    assert [s.id for s in plan.steps] == [1, 2]  # đánh số lại 1..n
+    assert [s.expect for s in plan.steps] == ["ok", "sold_out"]  # câu mô tả thành "ok", trạng thái thật được giữ
+    assert plan.steps[0].why == "" and plan.steps[1].args == {}
+
+
+def test_planner_sua_duoc_sau_phan_hoi_cua_harness():
+    approver_calls = []
+    planner = SequencePlanner(texts=["Xin chào, đây là kế hoạch!", GOOD_PLAN])  # lần 1 không có JSON
+    r = run_plan("happy", model=planner, approver=lambda p: approver_calls.append(p) or True)
+    assert (r.report["stop_letter"], r.report["rounds"], r.report["success"]) == ("A", 2, True)
+    assert r.trace.count("[Kế hoạch]") == 2 and "[Kế hoạch] (lần 2, sau khi sửa)" in r.trace
+    assert "[Harness → model] Kế hoạch bị từ chối: không tìm thấy JSON" in r.trace
+    assert len(approver_calls) == 1  # người duyệt chỉ thấy kế hoạch ĐÃ qua kiểm tra, không bị làm phiền bởi bản sai
+
+
+@pytest.mark.parametrize("plan_retries, rounds", [(0, 1), (1, 2), (3, 4)])
+def test_het_luot_sua_ke_hoach_thi_dung_o_ket_d(plan_retries, rounds):
+    r = run_plan("happy", planner_style="wrong_date", max_plan_retries=plan_retries)
+    assert r.report["stop_letter"] == "D" and r.report["rounds"] == rounds
+    assert r.world.trace == [] and r.report["tool_calls"] == 0  # không tool nào chạy
+    assert "khác ràng buộc" in r.report["stop_detail"]
