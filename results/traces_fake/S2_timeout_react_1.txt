@@ -1,0 +1,51 @@
+# ReAct · timeout
+
+[Yêu cầu] Đặt giúp tôi một vé bay SGN → DAD ngày 2026-10-07, khởi hành trước 12:00, giá không quá 2.000.000đ. Chọn chuyến rẻ nhất thoả các yêu cầu.
+[V1] Suy luận : Cần tìm các chuyến SGN→DAD ngày 2026-10-07 trước.
+[V1] Hành động: search_flights(origin='SGN', dest='DAD', date='2026-10-07')
+[V1] Quan sát : {"status": "ok", "flights": [{"flight": "VJ604", "depart": "06:30", "price": 1290000, "refundable": true}, {"flight": "VJ606", "depart": "0…
+[V2] Suy luận : Chuyến rẻ nhất thoả yêu cầu là VJ604, kiểm tra ghế còn không.
+[V2] Hành động: check_seat(flight='VJ604')
+[V2] Quan sát : {"status": "error", "error": "timeout", "hint": "Dịch vụ kiểm tra ghế đang lỗi, thử lại sau"}
+[V3] Suy luận : Chuyến rẻ nhất thoả yêu cầu là VJ604, kiểm tra ghế còn không.
+[V3] Hành động: check_seat(flight='VJ604')
+[V3] Quan sát : {"status": "error", "error": "timeout", "hint": "Dịch vụ kiểm tra ghế đang lỗi, thử lại sau"}
+[V4] Suy luận : Chuyến rẻ nhất thoả yêu cầu là VJ604, kiểm tra ghế còn không.
+[V4] Hành động: check_seat(flight='VJ604')
+[V4] Quan sát : {"status": "error", "error": "timeout", "hint": "Dịch vụ kiểm tra ghế đang lỗi, thử lại sau"}
+── Harness dừng vòng lặp ──
+   [Kết C · Phát hiện lặp] dừng BẤT THƯỜNG
+   Trạng thái     : đã thấy 10 chuyến, 3 chuyến thoả mọi ràng buộc (rẻ nhất: VJ604 1.290.000đ); chưa giữ chỗ
+   Tác dụng phụ   : chưa có (chưa giữ chỗ, chưa trả tiền)
+   Đã thử         : check_seat(flight='VJ604') → error/timeout ×3
+   Câu hỏi        : Agent bị kẹt: check_seat(flight='VJ604') lặp 3 lần. Nên thử lại sau hay đổi cách làm (ví dụ bỏ qua bước lỗi)?
+
+--- Câu trả lời cuối ---
+[Kết C · Phát hiện lặp] dừng BẤT THƯỜNG
+Trạng thái     : đã thấy 10 chuyến, 3 chuyến thoả mọi ràng buộc (rẻ nhất: VJ604 1.290.000đ); chưa giữ chỗ
+Tác dụng phụ   : chưa có (chưa giữ chỗ, chưa trả tiền)
+Đã thử         : check_seat(flight='VJ604') → error/timeout ×3
+Câu hỏi        : Agent bị kẹt: check_seat(flight='VJ604') lặp 3 lần. Nên thử lại sau hay đổi cách làm (ví dụ bỏ qua bước lỗi)?
+
+--- Bản bàn giao ---
+[Kết C · Phát hiện lặp] dừng BẤT THƯỜNG
+Trạng thái     : đã thấy 10 chuyến, 3 chuyến thoả mọi ràng buộc (rẻ nhất: VJ604 1.290.000đ); chưa giữ chỗ
+Tác dụng phụ   : chưa có (chưa giữ chỗ, chưa trả tiền)
+Đã thử         : check_seat(flight='VJ604') → error/timeout ×3
+Câu hỏi        : Agent bị kẹt: check_seat(flight='VJ604') lặp 3 lần. Nên thử lại sau hay đổi cách làm (ví dụ bỏ qua bước lỗi)?
+
+--- Số liệu ---
+{
+  "stop": "loop",
+  "stop_letter": "C",
+  "stop_detail": "check_seat(flight='VJ604') lặp 3 lần",
+  "success": false,
+  "rounds": 4,
+  "tool_calls": 4,
+  "tokens": 1688,
+  "cost_usd": 0.00697,
+  "seconds": 0.017,
+  "interventions": {},
+  "ungrounded": [],
+  "side_effects": []
+}

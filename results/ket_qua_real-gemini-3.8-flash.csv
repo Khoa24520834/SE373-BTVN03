@@ -1,0 +1,5 @@
+﻿scenario_id,scenario,pattern,model,run,stop_letter,stop,success,as_expected,rounds,tool_calls,tokens,cost_usd,seconds,replans,plan_steps,interventions,intervention_detail,ungrounded,side_effects,stop_detail,error
+S1,happy,react,real-gemini-3.8-flash,1,B,budget_exhausted,False,False,5,4,8702,0.01097,190.904,,,1,false_claim=1,0,book_seat,seconds 190.9/180.0,
+S1,happy,react,real-gemini-3.8-flash,2,,error,False,False,0,0,0,0.0,0.0,,,0,,0,,,"GoogleAPIError: 503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again "
+S1,happy,react,real-gemini-3.8-flash,3,,error,False,False,0,0,0,0.0,0.0,,,0,,0,,,"GoogleRateLimitError: Error calling model 'gemini-3.8-flash' (RESOURCE_EXHAUSTED): 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please"
+S1,happy,plan,real-gemini-3.8-flash,1,,error,False,False,0,0,0,0.0,0.0,,,0,,0,,,"GoogleRateLimitError: Error calling model 'gemini-3.8-flash' (RESOURCE_EXHAUSTED): 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please"
